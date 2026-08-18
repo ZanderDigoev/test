@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "avensis-obd"
+version = "1.0.0"
+description = "Диагностика Toyota Avensis через адаптер OBD-II (ELM327)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["obd2", "elm327", "toyota", "avensis", "diagnostics", "uds", "can"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Нужен только для USB- и Bluetooth-адаптеров. Wi-Fi адаптеры и встроенный
+# симулятор работают на стандартной библиотеке.
+serial = ["pyserial>=3.5"]
+dev = ["pytest>=7.0", "pyserial>=3.5"]
+
+[project.scripts]
+avensis = "avensis.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["avensis*"]
+
+[tool.setuptools.package-data]
+avensis = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

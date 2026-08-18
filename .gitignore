@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Локальные данные сеансов: дампы блоков, резервные копии, журналы
+*.log
+*.csv
+backups/
+confirmed_dids.json
