@@ -11,6 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+from avensis import engines as engine_module
 from avensis import pids as pid_module
 from avensis.dtc import Dtc, DtcStatus, parse_dtc_bytes
 from avensis.elm327 import Elm327
@@ -278,6 +279,31 @@ class ObdSession:
     def read_ecu_name(self) -> Dict[str, str]:
         """Имя блока управления (режим 09, PID 0A)."""
         return {ecu: self._to_text(raw) for ecu, raw in self._read_info(0x0A).items() if raw}
+
+    def detect_engine(self, forced_code: Optional[str] = None) -> engine_module.EngineDetection:
+        """Выяснить тип двигателя по данным с шины.
+
+        Опрашиваются два независимых источника: параметр «тип топлива» и
+        признак воспламенения от сжатия в байте готовности мониторов. Первый
+        точнее, второй работает и там, где параметр не поддерживается.
+        """
+        fuel_value = None
+        if not forced_code:
+            answers = self.read_pid(0x51)
+            if answers:
+                fuel_value = str(next(iter(answers.values())))
+
+        compression = None
+        if not forced_code:
+            statuses = self.read_monitor_status()
+            if statuses:
+                compression = next(iter(statuses.values())).compression_ignition
+
+        return engine_module.detect(
+            fuel_type_value=fuel_value,
+            compression_ignition=compression,
+            forced_code=forced_code,
+        )
 
     # ------------------------------------------------------- обзор шины
 

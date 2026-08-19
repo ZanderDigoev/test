@@ -12,7 +12,10 @@ from typing import List, Optional, Sequence
 
 from avensis import __version__
 from avensis import pids as pid_module
+from avensis import engines as engine_module
 from avensis import settings_ops
+from avensis import triplog
+from avensis import webui
 from avensis.dtc import DtcStatus
 from avensis.elm327 import Elm327, Elm327Error
 from avensis.framing import AdapterError
@@ -110,6 +113,11 @@ def _collect_report(
             "и убедись, что адаптер до конца вставлен в разъём."
         )
 
+    try:
+        report.engine = obd.detect_engine(getattr(args, "engine", None))
+    except ValueError as exc:
+        report.warnings.append(str(exc))
+
     report.vin_from_ecu = obd.read_vin()
     report.ecus = obd.discover_ecus()
     if not report.ecus:
@@ -124,7 +132,10 @@ def _collect_report(
     report.calibration_ids = obd.read_calibration_ids()
 
     if include_live:
-        report.live = obd.read_live_snapshot(pid_module.LIVE_DEFAULT)
+        # Набор параметров зависит от мотора: дизелю нужны рампа и наддув,
+        # бензину -- лямбды и коррекции.
+        wanted = report.engine.live_pids if report.engine else pid_module.LIVE_DEFAULT
+        report.live = obd.read_live_snapshot(wanted)
 
     if include_extended:
         report.extended_ecus = _probe_extended(elm, report)
@@ -249,13 +260,27 @@ def cmd_clear(args) -> int:
     return 0
 
 
+def _resolve_live_pids(args, obd: ObdSession) -> List[int]:
+    """Какие параметры снимать: заданные явно либо подобранные под мотор."""
+    if args.pids:
+        return [int(pid, 16) for pid in args.pids]
+    try:
+        detection = obd.detect_engine(getattr(args, "engine", None))
+    except ValueError as exc:
+        print(exc)
+        return pid_module.LIVE_DEFAULT
+    if detection.profile:
+        print(f"Двигатель: {detection.describe()}")
+    return detection.live_pids
+
+
 def cmd_live(args) -> int:
-    requested = [int(p, 16) for p in args.pids] if args.pids else pid_module.LIVE_DEFAULT
     elm = _connect(args)
     writer = None
     handle = None
     try:
         obd = ObdSession(elm)
+        requested = _resolve_live_pids(args, obd)
         if args.csv:
             handle = open(args.csv, "w", newline="", encoding="utf-8")
             writer = csv.writer(handle)
@@ -298,6 +323,84 @@ def cmd_live(args) -> int:
             handle.close()
             print(f"Записано в {args.csv}")
         elm.close()
+    return 0
+
+
+def cmd_log(args) -> int:
+    elm = _connect(args)
+    try:
+        obd = ObdSession(elm)
+        requested = _resolve_live_pids(args, obd)
+        vin = obd.read_vin() or args.vin or ""
+
+        meta = {
+            "автомобиль": vin or "VIN не прочитан",
+            "адаптер": elm.adapter_id,
+            "протокол": elm.protocol_name,
+            "параметров": len(requested),
+        }
+        try:
+            detection = obd.detect_engine(getattr(args, "engine", None))
+            meta["двигатель"] = detection.describe()
+        except ValueError:
+            pass
+
+        print(f"Запись в {args.output}. Остановить -- Ctrl+C.\n")
+        started = time.monotonic()
+        samples = 0
+        with triplog.TripWriter(Path(args.output), meta) as writer:
+            while True:
+                snapshot = obd.read_live_snapshot(requested)
+                mil = None
+                if not args.no_mil:
+                    statuses = obd.read_monitor_status()
+                    mil = any(status.mil_on for status in statuses.values()) if statuses else None
+                elapsed = time.monotonic() - started
+                writer.append(elapsed, snapshot, mil)
+                samples += 1
+
+                lamp = "  Check Engine ГОРИТ" if mil else ""
+                line = f"  замеров: {samples}   время: {elapsed:6.1f} с{lamp}"
+                if sys.stdout.isatty():
+                    print(f"\r{line}   ", end="", flush=True)
+                elif samples % 25 == 0:
+                    print(line, flush=True)
+
+                if args.duration and elapsed >= args.duration:
+                    break
+                if args.count and samples >= args.count:
+                    break
+                time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\n  Остановлено.")
+    finally:
+        elm.close()
+
+    print(f"\nЗаписано замеров: {samples}. Файл: {args.output}")
+    if args.plot:
+        trip = triplog.read_trip(Path(args.output))
+        Path(args.plot).write_text(triplog.render_html(trip), encoding="utf-8")
+        print(f"Графики: {args.plot}")
+    else:
+        print(f"Построить графики:  avensis plot {args.output}")
+    return 0
+
+
+def cmd_plot(args) -> int:
+    source = Path(args.file)
+    if not source.exists():
+        print(f"Файл {source} не найден.")
+        return 1
+    trip = triplog.read_trip(source)
+    if not trip.rows:
+        print("В журнале нет замеров.")
+        return 1
+
+    target = Path(args.output) if args.output else source.with_suffix(".html")
+    target.write_text(triplog.render_html(trip, title=args.title or source.stem), encoding="utf-8")
+    print(f"Замеров: {len(trip.rows)}, длительность: {trip.duration:.0f} с")
+    print(f"Графиков: {len(trip.numeric_columns())}")
+    print(f"Готово: {target}")
     return 0
 
 
@@ -409,6 +512,43 @@ def cmd_ecus(args) -> int:
                 print(f"        {value}")
     finally:
         elm.close()
+    return 0
+
+
+def cmd_web(args) -> int:
+    elm = _connect(args)
+    try:
+        webui.serve(
+            elm,
+            host=args.host,
+            port=args.http_port,
+            engine_code=getattr(args, "engine", None),
+            allow_write=args.allow_write,
+        )
+    finally:
+        elm.close()
+    return 0
+
+
+def cmd_engines(args) -> int:
+    if args.detect:
+        elm = _connect(args)
+        try:
+            detection = ObdSession(elm).detect_engine()
+        finally:
+            elm.close()
+        print(f"По данным с шины: {detection.describe()}\n")
+
+    print("Двигатели, ставившиеся на Avensis этого поколения:\n")
+    for profile in engine_module.ENGINE_PROFILES.values():
+        print(f"  {profile.code:<10} {profile.title}")
+        print(f"             {profile.fuel}, {profile.displacement}, {profile.years}")
+        if profile.notes:
+            print(f"             {profile.notes}")
+        print(f"             типовые коды: {', '.join(profile.watch_codes)}")
+        print()
+    print("Код мотора по шине не передаётся. Если знаешь свой — укажи его флагом")
+    print("--engine, тогда набор параметров и подсказки будут точнее.")
     return 0
 
 
@@ -656,6 +796,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timeout", type=float, default=5.0, help="таймаут ответа адаптера, с")
     parser.add_argument("--vin", help="ожидаемый VIN -- программа сверит его с записанным в блоке")
+    parser.add_argument(
+        "--engine",
+        help="код двигателя (1ZZ-FE, 1CD-FTV, 2AD-FTV, ...); уточняет набор параметров",
+    )
     parser.add_argument("--trace", action="store_true", help="печатать весь обмен с адаптером")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="подробный журнал")
 
@@ -687,6 +831,22 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--csv", help="дополнительно записывать в CSV-файл")
     live.set_defaults(func=cmd_live)
 
+    log_cmd = sub.add_parser("log", help="записать параметры за поездку в файл")
+    log_cmd.add_argument("pids", nargs="*", help="номера параметров в hex; без них -- набор под мотор")
+    log_cmd.add_argument("-o", "--output", default="poezdka.csv", help="файл журнала")
+    log_cmd.add_argument("--interval", type=float, default=1.0, help="пауза между замерами, с")
+    log_cmd.add_argument("--duration", type=float, help="сколько секунд писать")
+    log_cmd.add_argument("--count", type=int, help="сколько замеров сделать")
+    log_cmd.add_argument("--no-mil", action="store_true", help="не отслеживать Check Engine")
+    log_cmd.add_argument("--plot", help="сразу построить графики в указанный HTML-файл")
+    log_cmd.set_defaults(func=cmd_log)
+
+    plot = sub.add_parser("plot", help="построить графики по журналу поездки")
+    plot.add_argument("file", help="файл журнала, записанный командой log")
+    plot.add_argument("-o", "--output", help="куда сохранить HTML; по умолчанию рядом с журналом")
+    plot.add_argument("--title", help="заголовок страницы")
+    plot.set_defaults(func=cmd_plot)
+
     freeze = sub.add_parser("freeze", help="показать стоп-кадр")
     freeze.add_argument("--frame", type=int, default=0, help="номер кадра")
     freeze.set_defaults(func=cmd_freeze)
@@ -700,6 +860,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     ecus = sub.add_parser("ecus", help="найти блоки управления на шине")
     ecus.set_defaults(func=cmd_ecus)
+
+    web = sub.add_parser("web", help="графический интерфейс в браузере")
+    web.add_argument("--host", default="127.0.0.1",
+                     help="адрес прослушивания; по умолчанию только этот компьютер")
+    # Не "--port": это имя уже занято глобальным флагом выбора адаптера.
+    web.add_argument("--http-port", type=int, default=8327, dest="http_port",
+                     help="TCP-порт, на котором открыть интерфейс")
+    web.add_argument("--allow-write", action="store_true",
+                     help="разрешить сброс ошибок из интерфейса")
+    web.set_defaults(func=cmd_web)
+
+    engines = sub.add_parser("engines", help="справочник двигателей этого кузова")
+    engines.add_argument("--detect", action="store_true", help="сначала определить мотор по шине")
+    engines.set_defaults(func=cmd_engines)
 
     raw = sub.add_parser("raw", help="отправить произвольную команду адаптеру")
     raw.add_argument("command", help="например 010C или ATRV")

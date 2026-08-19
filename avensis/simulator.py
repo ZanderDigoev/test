@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -22,6 +23,81 @@ PROMPT = "\r\r>"
 def _pad(data: bytes, size: int = 8) -> bytes:
     """Добить кадр до восьми байт, как это делает реальная шина CAN."""
     return data + bytes(size - len(data)) if len(data) < size else data
+
+
+#: Длина синтетической поездки в замерах, после чего цикл повторяется.
+CYCLE_LENGTH = 140
+
+
+def drive_cycle(tick: int) -> Dict[int, bytes]:
+    """Значения параметров на заданном шаге синтетической поездки.
+
+    Нужен, чтобы журнал поездки и графики можно было проверить без машины:
+    на постоянных значениях график вырождается в прямую и ничего не доказывает.
+
+    Нулевой шаг намеренно совпадает с холостым ходом прогретого до 50 °C
+    двигателя -- от него отсчитываются остальные проверки.
+    """
+    phase = tick % CYCLE_LENGTH
+
+    if phase < 6:                     # стоим на холостых
+        speed = 0.0
+    elif phase < 45:                  # разгон
+        speed = (phase - 6) / 39 * 90
+    elif phase < 95:                  # движение с переменной скоростью
+        speed = 90 + 25 * math.sin((phase - 45) / 50 * 2 * math.pi)
+    elif phase < 125:                 # торможение
+        speed = 90 * (125 - phase) / 30
+    else:                             # снова холостой ход
+        speed = 0.0
+    speed = max(0.0, speed)
+
+    # Обороты: холостые плюс вклад скорости, как на четвёртой передаче.
+    rpm = 750 + speed * 24 if speed else 750
+    # Нагрузка растёт при разгоне и падает при торможении.
+    acceleration = speed - max(0.0, drive_cycle_speed(phase - 1))
+    load = 27.06 + acceleration * 4.5 + (12 if speed else 0)
+    load = min(95.0, max(15.0, load))
+    throttle = min(85.0, max(12.94, load * 0.8))
+    # Двигатель прогревается до рабочей температуры и держит её.
+    coolant = min(88, 50 + tick * 0.55)
+    intake = 17 + (4 if speed > 40 else 0)
+    maf = max(3.25, 3.25 + rpm / 1000 * load / 18)
+    rail = 250 + load * 12          # давление в топливной рампе, бар
+    oil = min(95, 45 + tick * 0.5)
+
+    def percent(value: float) -> bytes:
+        return bytes([max(0, min(255, round(value * 255 / 100)))])
+
+    return {
+        0x04: percent(load),
+        0x05: bytes([round(coolant) + 40]),
+        0x0B: bytes([max(20, min(250, round(30 + load * 1.6)))]),
+        0x0C: round(rpm * 4).to_bytes(2, "big"),
+        0x0D: bytes([min(255, round(speed))]),
+        0x0F: bytes([intake + 40]),
+        0x10: min(65535, round(maf * 100)).to_bytes(2, "big"),
+        0x11: percent(throttle),
+        0x23: min(65535, round(rail)).to_bytes(2, "big"),
+        0x2F: bytes([round(110 - tick * 0.05)]),
+        0x5C: bytes([round(oil) + 40]),
+        0x62: bytes([min(255, round(125 + load * 0.6))]),
+    }
+
+
+def drive_cycle_speed(phase: int) -> float:
+    """Скорость на предыдущем шаге -- нужна, чтобы оценить ускорение."""
+    if phase < 0:
+        return 0.0
+    if phase < 6:
+        return 0.0
+    if phase < 45:
+        return (phase - 6) / 39 * 90
+    if phase < 95:
+        return 90 + 25 * math.sin((phase - 45) / 50 * 2 * math.pi)
+    if phase < 125:
+        return max(0.0, 90 * (125 - phase) / 30)
+    return 0.0
 
 
 @dataclass
@@ -170,6 +246,8 @@ class ElmSimulator:
         self.session: Dict[str, int] = {}
         self._buffer = ""
         self._last_command = ""
+        self._tick = 0
+        self._round_pids: set = set()
 
     # ------------------------------------------------------------- ввод/вывод
 
@@ -285,8 +363,14 @@ class ElmSimulator:
 
         if mode == 0x01 and ecu.obd_capable and len(request) >= 2:
             pid = request[1]
-            table = ecu.supported_pids if pid in ecu.supported_pids else ecu.live
-            value = table.get(pid)
+            if pid in ecu.supported_pids:
+                return bytes([0x41, pid]) + ecu.supported_pids[pid]
+
+            if ecu.response_id in ("7E8", "10") and pid in ecu.live:
+                self._advance_cycle(pid)
+                value = drive_cycle(self._tick).get(pid, ecu.live[pid])
+            else:
+                value = ecu.live.get(pid)
             return bytes([0x41, pid]) + value if value else None
 
         if mode == 0x02 and ecu.obd_capable and len(request) >= 2:
@@ -323,6 +407,19 @@ class ElmSimulator:
             return self._uds(ecu, request)
 
         return None
+
+    def _advance_cycle(self, pid: int) -> None:
+        """Перейти к следующему шагу поездки, когда начался новый круг опроса.
+
+        Признак нового круга -- повторный запрос параметра, уже опрошенного
+        в текущем круге. Благодаря этому один полный опрос машины видит
+        согласованный между собой набор значений, а цикл записи журнала
+        получает на каждом проходе новые.
+        """
+        if pid in self._round_pids:
+            self._round_pids.clear()
+            self._tick += 1
+        self._round_pids.add(pid)
 
     def _vehicle_info(self, ecu: VirtualEcu, info_type: int):
         if info_type == 0x00:

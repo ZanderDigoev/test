@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from avensis import pids as pid_module
 from avensis.dtc import Dtc, DtcStatus
+from avensis.engines import EngineDetection
 from avensis.obd import EcuInfo, FreezeFrame
 from avensis.vin import describe_vin
 
@@ -28,6 +29,7 @@ class VehicleReport:
     voltage: Optional[float] = None
     vin_from_ecu: Optional[str] = None
     vin_expected: Optional[str] = None
+    engine: Optional[EngineDetection] = None
     ecus: List[EcuInfo] = field(default_factory=list)
     extended_ecus: List[Dict[str, Any]] = field(default_factory=list)
     monitors: Dict[str, pid_module.MonitorStatus] = field(default_factory=dict)
@@ -53,6 +55,26 @@ class VehicleReport:
     def by_status(self, status: str) -> List[Dtc]:
         return [code for code in self.dtcs if code.status == status]
 
+    @property
+    def typical_faults(self) -> List[Dtc]:
+        """Найденные коды, которые для этого мотора считаются типовыми.
+
+        Совпадение ничего не доказывает, но подсказывает, с чего начинать
+        проверку: такие неисправности на этом двигателе встречаются чаще прочих.
+        """
+        profile = self.engine.profile if self.engine else None
+        if profile is None:
+            return []
+        watch = set(profile.watch_codes)
+        # Один код может прийти и как сохранённый, и как постоянный --
+        # в подсказке он нужен один раз.
+        seen, unique = set(), []
+        for code in self.dtcs:
+            if code.code in watch and code.code not in seen:
+                seen.add(code.code)
+                unique.append(code)
+        return unique
+
     # -------------------------------------------------------- сериализация
 
     def to_dict(self) -> Dict[str, Any]:
@@ -70,6 +92,16 @@ class VehicleReport:
                 if (self.vin_from_ecu or self.vin_expected)
                 else {},
             },
+            "engine": {
+                "fuel": self.engine.fuel,
+                "source": self.engine.source,
+                "description": self.engine.describe(),
+                "candidates": [p.code for p in self.engine.candidates],
+                "selected": self.engine.profile.code if self.engine.profile else None,
+            }
+            if self.engine
+            else None,
+            "typical_faults": [code.code for code in self.typical_faults],
             "ecus": [asdict(ecu) for ecu in self.ecus],
             "extended_ecus": self.extended_ecus,
             "monitors": {
@@ -144,6 +176,18 @@ def render_text(report: VehicleReport) -> str:
         elif report.vin_expected and not report.vin_from_ecu:
             out.append("  Блок не отдал VIN (обычное дело для машин до 2008 года)")
 
+    if report.engine:
+        out.append(_section("ДВИГАТЕЛЬ"))
+        out.append(f"  {report.engine.describe()}")
+        profile = report.engine.profile
+        if profile and report.engine.forced:
+            out.append(f"  {profile.displacement}, годы выпуска {profile.years}")
+            if profile.notes:
+                out.append(f"  {profile.notes}")
+        elif report.engine.candidates:
+            out.append("  Точный код мотора по шине не передаётся — если знаешь его,")
+            out.append("  укажи флагом --engine, и подбор параметров станет точнее.")
+
     if report.ecus:
         out.append(_section("БЛОКИ УПРАВЛЕНИЯ НА ШИНЕ"))
         for ecu in report.ecus:
@@ -189,6 +233,14 @@ def render_text(report: VehicleReport) -> str:
         for code in group:
             mark = "" if code.known else "  [описания в базе нет]"
             out.append(f"    {code.code}  [{code.ecu}]  {code.description}{mark}")
+
+    typical = report.typical_faults
+    if typical:
+        out.append(_section("ТИПОВЫЕ ДЛЯ ЭТОГО МОТОРА"))
+        out.append("  Эти коды на таком двигателе встречаются чаще прочих —")
+        out.append("  разумно начать проверку с них:")
+        for code in typical:
+            out.append(f"    {code.code}  {code.description}")
 
     if report.freeze_frames:
         out.append(_section("СТОП-КАДР (параметры в момент фиксации ошибки)"))
@@ -239,6 +291,12 @@ def render_markdown(report: VehicleReport) -> str:
             out.append(f"| ⚠ Расхождение | в блоке {report.vin_from_ecu}, ожидался {report.vin_expected} |")
         out.append("")
 
+    if report.engine:
+        out += ["## Двигатель", "", report.engine.describe(), ""]
+        profile = report.engine.profile
+        if profile and report.engine.forced and profile.notes:
+            out += [f"> {profile.notes}", ""]
+
     if report.ecus:
         out += ["## Блоки управления", "", "| Адрес | Назначение | Параметров |", "| --- | --- | --- |"]
         out += [
@@ -256,6 +314,12 @@ def render_markdown(report: VehicleReport) -> str:
             f"| **{code.code}** | {code.status} | `{code.ecu}` | {code.description} |"
             for code in report.dtcs
         ]
+        out.append("")
+
+    if report.typical_faults:
+        out += ["## Типовые для этого мотора", "",
+                "Эти коды на таком двигателе встречаются чаще прочих:", ""]
+        out += [f"- **{c.code}** — {c.description}" for c in report.typical_faults]
         out.append("")
 
     if report.monitors:

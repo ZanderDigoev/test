@@ -139,3 +139,90 @@ def test_bad_port_gives_actionable_advice(capsys):
     code, out = run(capsys, "--port", "/dev/definitely-not-here", "dtc")
     assert code == 1
     assert "зажигание" in out
+
+
+# ------------------------------------------------- журнал поездки и справочники
+
+
+def test_log_records_requested_number_of_samples(capsys, tmp_path):
+    target = tmp_path / "poezdka.csv"
+    code, out = run(capsys, "log", "0C", "0D", "--count", "5", "--interval", "0",
+                    "-o", str(target))
+    assert code == 0
+    assert "Записано замеров: 5" in out
+    rows = [r for r in target.read_text(encoding="utf-8-sig").splitlines()
+            if r and not r.startswith("#")]
+    assert len(rows) == 6  # заголовок и пять замеров
+
+
+def test_log_can_plot_straight_away(capsys, tmp_path):
+    csv_path, html_path = tmp_path / "t.csv", tmp_path / "t.html"
+    run(capsys, "log", "0C", "--count", "4", "--interval", "0",
+        "-o", str(csv_path), "--plot", str(html_path))
+    assert "<svg" in html_path.read_text(encoding="utf-8")
+
+
+def test_log_records_the_lamp_state(capsys, tmp_path):
+    target = tmp_path / "t.csv"
+    run(capsys, "log", "0C", "--count", "3", "--interval", "0", "-o", str(target))
+    assert "Check Engine" in target.read_text(encoding="utf-8-sig")
+
+
+def test_log_without_mil_tracking_omits_the_column(capsys, tmp_path):
+    target = tmp_path / "t.csv"
+    run(capsys, "log", "0C", "--count", "3", "--interval", "0", "--no-mil", "-o", str(target))
+    assert "Check Engine" not in target.read_text(encoding="utf-8-sig")
+
+
+def test_plot_defaults_to_a_sibling_file(capsys, tmp_path):
+    csv_path = tmp_path / "poezdka.csv"
+    run(capsys, "log", "0C", "0D", "--count", "6", "--interval", "0", "-o", str(csv_path))
+    code, out = run(capsys, "plot", str(csv_path))
+    assert code == 0
+    assert (tmp_path / "poezdka.html").exists()
+    assert "Графиков:" in out
+
+
+def test_plot_reports_a_missing_file(capsys, tmp_path):
+    code, out = run(capsys, "plot", str(tmp_path / "нет-такого.csv"))
+    assert code == 1
+    assert "не найден" in out
+
+
+def test_engine_flag_selects_diesel_parameters(capsys):
+    _, out = run(capsys, "--engine", "1CD-FTV", "scan", "--json")
+    data = json.loads(out)
+    assert data["engine"]["selected"] == "1CD-FTV"
+    assert "23" in data["live"]  # давление в топливной рампе
+
+
+def test_engine_is_detected_without_the_flag(capsys):
+    _, out = run(capsys, "scan", "--json")
+    assert data_fuel(out) == "бензиновый"
+
+
+def data_fuel(out: str) -> str:
+    return json.loads(out)["engine"]["fuel"]
+
+
+def test_typical_faults_are_listed_once(capsys):
+    _, out = run(capsys, "scan", "--json")
+    faults = json.loads(out)["typical_faults"]
+    assert faults == list(dict.fromkeys(faults))
+    assert "P0301" in faults
+
+
+def test_unknown_engine_is_reported_not_crashed(capsys):
+    _, out = run(capsys, "--engine", "2JZ-GTE", "scan", "--no-live")
+    assert "Неизвестный код двигателя" in out
+
+
+def test_engines_command_lists_the_range(capsys):
+    code, out = run(capsys, "engines")
+    assert code == 0
+    assert "1CD-FTV" in out and "2AD-FTV" in out and "1ZZ-FE" in out
+
+
+def test_engines_can_detect_first(capsys):
+    _, out = run(capsys, "engines", "--detect")
+    assert "По данным с шины" in out
