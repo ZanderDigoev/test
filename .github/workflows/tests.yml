@@ -1,12 +1,19 @@
 name: Тесты
 
 on:
+  # Только основная ветка: для остальных проверку запускает pull_request,
+  # иначе на каждый push в ветку с открытым PR всё гонялось бы дважды.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
+
+concurrency:
+  # Новый push отменяет предыдущий незавершённый прогон той же ветки.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   tests:
