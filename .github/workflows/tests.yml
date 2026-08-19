@@ -1,0 +1,63 @@
+name: Тесты
+
+on:
+  # Только основная ветка: для остальных проверку запускает pull_request,
+  # иначе на каждый push в ветку с открытым PR всё гонялось бы дважды.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Новый push отменяет предыдущий незавершённый прогон той же ветки.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Падение на одной версии не должно скрывать результат на остальных.
+      fail-fast: false
+      matrix:
+        # Нижняя граница взята из requires-python, верхняя -- текущий выпуск.
+        python: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Установка
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Тесты
+        run: pytest -q
+
+  lint:
+    name: Проверка кода
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установка
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyflakes
+
+      - name: Неиспользуемый код и опечатки в именах
+        run: python -m pyflakes avensis/ tests/
+
+      - name: Компиляция всех модулей
+        run: python -m compileall -q avensis tests
